@@ -831,43 +831,6 @@ static void __show_smap(struct seq_file *m, const struct mem_size_stats *mss)
 
 static int show_smap(struct seq_file *m, void *v)
 {
-	struct proc_maps_private *priv = m->private;
-	struct vm_area_struct *vma = v;
-	struct mem_size_stats mss_stack;
-	struct mem_size_stats *mss;
-	int ret = 0;
-	bool rollup_mode;
-	bool last_vma;
-
-	if (priv->rollup) {
-		rollup_mode = true;
-		mss = priv->rollup;
-		if (mss->first) {
-			mss->first_vma_start = vma->vm_start;
-			mss->first = false;
-		}
-		last_vma = !m_next_vma(priv, vma);
-	} else {
-		rollup_mode = false;
-		memset(&mss_stack, 0, sizeof(mss_stack));
-		mss = &mss_stack;
-	}
-
-	smap_gather_stats(vma, mss);
-
-	if (!rollup_mode) {
-		show_map_vma(m, vma);
-	} else if (last_vma) {
-		show_vma_header_prefix(
-			m, mss->first_vma_start, vma->vm_end, 0, 0, 0, 0);
-		seq_pad(m, ' ');
-		seq_puts(m, "[rollup]\n");
-	} else {
-		ret = SEQ_SKIP;
-	}
-
-static int show_smap(struct seq_file *m, void *v)
-{
 	struct vm_area_struct *vma = v;
 	struct mem_size_stats mss;
 
@@ -882,34 +845,17 @@ static int show_smap(struct seq_file *m, void *v)
 		seq_putc(m, '\n');
 	}
 
-	if (!rollup_mode || last_vma)
-		__show_smap(m, mss);
+	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
+	SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
+	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
+	seq_puts(m, " kB\n");
 
-	if (!rollup_mode || last_vma) {
-		SEQ_PUT_DEC("Rss:            ", mss->resident);
-		SEQ_PUT_DEC(" kB\nPss:            ", mss->pss >> PSS_SHIFT);
-		SEQ_PUT_DEC(" kB\nShared_Clean:   ", mss->shared_clean);
-		SEQ_PUT_DEC(" kB\nShared_Dirty:   ", mss->shared_dirty);
-		SEQ_PUT_DEC(" kB\nPrivate_Clean:  ", mss->private_clean);
-		SEQ_PUT_DEC(" kB\nPrivate_Dirty:  ", mss->private_dirty);
-		SEQ_PUT_DEC(" kB\nReferenced:     ", mss->referenced);
-		SEQ_PUT_DEC(" kB\nAnonymous:      ", mss->anonymous);
-		SEQ_PUT_DEC(" kB\nLazyFree:       ", mss->lazyfree);
-		SEQ_PUT_DEC(" kB\nAnonHugePages:  ", mss->anonymous_thp);
-		SEQ_PUT_DEC(" kB\nShmemPmdMapped: ", mss->shmem_thp);
-		SEQ_PUT_DEC(" kB\nShared_Hugetlb: ", mss->shared_hugetlb);
-		seq_put_decimal_ull_width(m, " kB\nPrivate_Hugetlb: ",
-					  mss->private_hugetlb >> 10, 7);
-		SEQ_PUT_DEC(" kB\nSwap:           ", mss->swap);
-		SEQ_PUT_DEC(" kB\nSwapPss:        ",
-						mss->swap_pss >> PSS_SHIFT);
-		SEQ_PUT_DEC(" kB\nLocked:         ", mss->pss >> PSS_SHIFT);
-		seq_puts(m, " kB\n");
-	}
-	if (!rollup_mode) {
-		arch_show_smap(m, vma);
-		show_smap_vma_flags(m, vma);
-	}
+	__show_smap(m, &mss);
+
+	if (arch_pkeys_enabled())
+		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+	show_smap_vma_flags(m, vma);
+
 	m_cache_vma(m, vma);
 
 	return 0;
@@ -939,59 +885,9 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
 	down_read(&mm->mmap_sem);
 	hold_task_mempolicy(priv);
 
-	for (vma = priv->mm->mmap; vma;) {
+	for (vma = priv->mm->mmap; vma; vma = vma->vm_next) {
 		smap_gather_stats(vma, &mss);
 		last_vma_end = vma->vm_end;
-
-		/*
-		 * Release mmap_sem temporarily if someone wants to
-		 * access it for write request.
-		 */
-		if (rwsem_is_contended(&mm->mmap_sem)) {
-			up_read(&mm->mmap_sem);
-			down_read(&mm->mmap_sem);
-
-			/*
-			 * After dropping the lock, there are three cases to
-			 * consider. See the following example for explanation.
-			 *
-			 *   +------+------+-----------+
-			 *   | VMA1 | VMA2 | VMA3      |
-			 *   +------+------+-----------+
-			 *   |      |      |           |
-			 *  4k     8k     16k         400k
-			 *
-			 * Suppose we drop the lock after reading VMA2 due to
-			 * contention, then we get:
-			 *
-			 *	last_vma_end = 16k
-			 *
-			 * 1) VMA2 is freed, but VMA3 exists:
-			 *
-			 *    find_vma(mm, 16k - 1) will return VMA3.
-			 *    In this case, just continue from VMA3.
-			 *
-			 * 2) VMA2 still exists:
-			 *
-			 *    find_vma(mm, 16k - 1) will return VMA2.
-			 *    Iterate the loop like the original one.
-			 *
-			 * 3) No more VMAs can be found:
-			 *
-			 *    find_vma(mm, 16k - 1) will return NULL.
-			 *    No more things to do, just break.
-			 */
-			vma = find_vma(mm, last_vma_end - 1);
-			/* Case 3 above */
-			if (!vma)
-				break;
-
-			/* Case 1 above */
-			if (vma->vm_start >= last_vma_end)
-				continue;
-		}
-		/* Case 2 above */
-		vma = vma->vm_next;
 	}
 
 	show_vma_header_prefix(m, priv->mm->mmap->vm_start,
@@ -1054,6 +950,18 @@ out_free:
 	return ret;
 }
 
+static int smaps_rollup_release(struct inode *inode, struct file *file)
+{
+	struct seq_file *seq = file->private_data;
+	struct proc_maps_private *priv = seq->private;
+
+	if (priv->mm)
+		mmdrop(priv->mm);
+
+	kfree(priv);
+	return single_release(inode, file);
+}
+
 const struct file_operations proc_pid_smaps_operations = {
 	.open		= pid_smaps_open,
 	.read		= seq_read,
@@ -1065,7 +973,7 @@ const struct file_operations proc_pid_smaps_rollup_operations = {
 	.open		= smaps_rollup_open,
 	.read		= seq_read,
 	.llseek		= seq_lseek,
-	.release	= proc_map_release,
+	.release	= smaps_rollup_release,
 };
 
 enum clear_refs_types {
