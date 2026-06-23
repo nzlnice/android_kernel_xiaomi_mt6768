@@ -17,6 +17,19 @@
 #include <linux/vmalloc.h>
 #include "erofs_fs.h"
 
+#ifndef atomic_cond_read_relaxed
+#define atomic_cond_read_relaxed(v, expr) ({ \
+	typeof((v)->counter) VAL; \
+	for (;;) { \
+		VAL = READ_ONCE((v)->counter); \
+		if (expr) \
+			break; \
+		cpu_relax(); \
+	} \
+	VAL; \
+})
+#endif
+
 /* redefine pr_fmt "erofs: " */
 #undef pr_fmt
 #define pr_fmt(fmt) "erofs: " fmt
