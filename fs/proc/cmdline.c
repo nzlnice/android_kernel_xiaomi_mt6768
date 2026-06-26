@@ -8,16 +8,28 @@
 extern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
 #endif
 
+// 如果你同时还想保留普通的 KernelSU 挂钩（做双重保险，如果 SUSFS 没开启的话）
+#ifdef CONFIG_KERNELSU
+extern char *ksu_handle_cmdline(char *cmdline);
+#endif
+
 static int cmdline_proc_show(struct seq_file *m, void *v)
 {
+	/* 1. 优先走 SUSFS 的命令行欺骗逻辑 */
 #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
 	if (!susfs_spoof_cmdline_or_bootconfig(m)) {
 		seq_putc(m, '\n');
 		return 0;
 	}
 #endif
-#ifdef CONFIG_INITRAMFS_IGNORE_SKIP_FLAG
+
+	/* 2. 如果 SUSFS 没起作用或未开启，回退到普通 KernelSU 处理，或者原本的系统逻辑 */
+#ifdef CONFIG_KERNELSU
+	seq_printf(m, "%s\n", ksu_handle_cmdline(saved_command_line));
+#else
 	seq_printf(m, "%s\n", saved_command_line);
+#endif
+
 	return 0;
 }
 
